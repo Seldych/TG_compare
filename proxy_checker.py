@@ -1,3 +1,11 @@
+"""Проверка MTProto-прокси Telegram через raw TCP/TLS сокет.
+
+Публичные функции:
+    check_one(server, port, secret, timeout) -> bool
+    check_all_socket(lines, max_concurrent, timeout) -> list[(str, bool)]
+    check_all_telethon(lines, ...) -> stub
+"""
+
 import socket
 import ssl
 import concurrent.futures

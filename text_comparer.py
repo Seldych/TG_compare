@@ -9,12 +9,12 @@ from proxy_checker import check_all_socket, check_all_telethon
 
 
 class TextComparer:
-    """Приложение для отбора новых прокси-серверов Telegram.
+    """Приложение для отбора и проверки MTProto-прокси Telegram.
 
     Сравнивает два списка proxy-URL (File_1 — старый, File_2 — новый),
-    показывает строки из File_2, отсутствующие в File_1.
-    Позволяет проверять прокси (TCP/TLS сокет или Telethon),
-    просматривать/удалять записи, сохранять итоговый список в File_3.
+    находит новые записи, проверяет их через TCP/TLS сокет (или Telethon),
+    маркирует живые (✓) и мёртвые (✗), позволяет удалять лишние
+    и сохраняет только живые в итоговый файл (File_3).
     """
 
     def __init__(self, root):
@@ -37,7 +37,7 @@ class TextComparer:
         self._create_widgets()
 
     def _create_widgets(self):
-        """Создать и разместить все элементы интерфейса."""
+        """Создать и разместить все элементы интерфейса: текстовую область, радиокнопки выбора метода проверки, кнопки действий, статус-бар."""
         self.text_area = scrolledtext.ScrolledText(
             self.root, wrap=tk.WORD, state=tk.DISABLED,
             font=("Consolas", 10), bg="#f5f5f5"
@@ -102,7 +102,7 @@ class TextComparer:
         ).pack(side=tk.RIGHT)
 
     def _refresh_display(self):
-        """Обновить текст в окне с учётом self.alive."""
+        """Обновить текст в окне с префиксами ✓/✗ для живых/мёртвых прокси."""
         lines = []
         for l in self.result_lines:
             if l in self.alive:
