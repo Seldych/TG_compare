@@ -2,11 +2,10 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 from urllib.parse import urlparse, parse_qs
 import os
-import threading
 import json
-import asyncio
+import concurrent.futures
 
-from proxy_checker import check_all
+from proxy_checker import check_all_socket, check_all_telethon
 
 
 class TextComparer:
@@ -14,8 +13,8 @@ class TextComparer:
 
     Сравнивает два списка proxy-URL (File_1 — старый, File_2 — новый),
     показывает строки из File_2, отсутствующие в File_1.
-    Позволяет проверять прокси через Telethon, просматривать/удалять записи,
-    сохранять итоговый актуальный список в File_3.
+    Позволяет проверять прокси (TCP/TLS сокет или Telethon),
+    просматривать/удалять записи, сохранять итоговый список в File_3.
     """
 
     def __init__(self, root):
@@ -33,6 +32,7 @@ class TextComparer:
         self.deleted_count = 0
         self.alive = {}
         self._checking = False
+        self.check_method = tk.StringVar(value="socket")
 
         self._create_widgets()
 
@@ -42,14 +42,27 @@ class TextComparer:
             self.root, wrap=tk.WORD, state=tk.DISABLED,
             font=("Consolas", 10), bg="#f5f5f5"
         )
-        self.text_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.text_area.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 5))
 
         self.text_area.bind("<Control-c>", self._copy_selection)
         self.text_area.bind("<Button-3>", self._show_context_menu)
         self.text_area.bind("<Double-Button-1>", self._on_double_click)
 
+        # Переключатель метода проверки
+        method_frame = tk.Frame(self.root)
+        method_frame.pack(pady=(0, 5))
+        tk.Label(method_frame, text="Метод проверки:").pack(side=tk.LEFT, padx=(0, 10))
+        tk.Radiobutton(
+            method_frame, text="Быстрая (TCP/TLS)",
+            variable=self.check_method, value="socket"
+        ).pack(side=tk.LEFT, padx=5)
+        tk.Radiobutton(
+            method_frame, text="Точная (Telethon)",
+            variable=self.check_method, value="telethon"
+        ).pack(side=tk.LEFT, padx=5)
+
         btn_frame = tk.Frame(self.root)
-        btn_frame.pack(pady=10)
+        btn_frame.pack(pady=5)
 
         self.btn_open = tk.Button(
             btn_frame, text="Открыть", command=self._on_open,
@@ -256,36 +269,47 @@ class TextComparer:
         return result["ok"]
 
     def _on_check(self):
-        """Запустить проверку прокси через Telethon."""
+        """Запустить проверку прокси выбранным методом."""
         if self._checking or not self.result_lines:
             return
 
-        config = self._load_config()
-        if config is None:
-            ok = self._show_config_dialog()
-            if not ok:
-                return
+        method = self.check_method.get()
+
+        if method == "telethon":
             config = self._load_config()
             if config is None:
-                return
+                ok = self._show_config_dialog()
+                if not ok:
+                    return
+                config = self._load_config()
+                if config is None:
+                    return
+            api_id, api_hash = config
+            check_func = check_all_telethon
+            check_kwargs = {"api_id": api_id, "api_hash": api_hash}
+        else:
+            check_func = check_all_socket
+            check_kwargs = {}
 
-        api_id, api_hash = config
         self._checking = True
         self.btn_check.config(state=tk.DISABLED, text="Проверка...")
         self.btn_open.config(state=tk.DISABLED)
         self.status_var.set("Проверка прокси...")
 
         def _run():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
             try:
-                results = loop.run_until_complete(
-                    check_all(self.result_lines, api_id, api_hash)
-                )
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    future = pool.submit(
+                        check_func, self.result_lines, **check_kwargs
+                    )
+                    results = future.result(timeout=300)
                 self.root.after(0, self._finish_check, results)
+            except NotImplementedError as e:
+                self.root.after(0, lambda: self._fail_check(str(e)))
             except Exception as e:
                 self.root.after(0, lambda: self._fail_check(str(e)))
 
+        import threading
         threading.Thread(target=_run, daemon=True).start()
 
     def _finish_check(self, results):
