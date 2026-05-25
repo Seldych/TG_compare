@@ -2,6 +2,11 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 from urllib.parse import urlparse, parse_qs
 import os
+import threading
+import json
+import asyncio
+
+from proxy_checker import check_all
 
 
 class TextComparer:
@@ -9,7 +14,7 @@ class TextComparer:
 
     Сравнивает два списка proxy-URL (File_1 — старый, File_2 — новый),
     показывает строки из File_2, отсутствующие в File_1.
-    Позволяет просматривать и удалять отдельные записи,
+    Позволяет проверять прокси через Telethon, просматривать/удалять записи,
     сохранять итоговый актуальный список в File_3.
     """
 
@@ -26,6 +31,8 @@ class TextComparer:
 
         self.result_lines = []
         self.deleted_count = 0
+        self.alive = {}
+        self._checking = False
 
         self._create_widgets()
 
@@ -49,6 +56,12 @@ class TextComparer:
             width=15, height=2
         )
         self.btn_open.pack(side=tk.LEFT, padx=5)
+
+        self.btn_check = tk.Button(
+            btn_frame, text="Проверить", command=self._on_check,
+            width=15, height=2, state=tk.DISABLED
+        )
+        self.btn_check.pack(side=tk.LEFT, padx=5)
 
         self.btn_save = tk.Button(
             btn_frame, text="Сохранить", command=self._on_save,
@@ -75,8 +88,16 @@ class TextComparer:
             anchor=tk.E
         ).pack(side=tk.RIGHT)
 
-    def _set_text(self, text):
-        """Заполнить текстовую область новым содержимым (read-only)."""
+    def _refresh_display(self):
+        """Обновить текст в окне с учётом self.alive."""
+        lines = []
+        for l in self.result_lines:
+            if l in self.alive:
+                prefix = "\u2713 " if self.alive[l] else "\u2717 "
+            else:
+                prefix = ""
+            lines.append(prefix + l)
+        text = "\n".join(lines)
         self.text_area.config(state=tk.NORMAL)
         self.text_area.delete(1.0, tk.END)
         self.text_area.insert(1.0, text)
@@ -105,7 +126,8 @@ class TextComparer:
             index = self.text_area.index(tk.CURRENT)
             line_start = f"{index.split('.')[0]}.0"
             line_end = f"{index.split('.')[0]}.end"
-            line = self.text_area.get(line_start, line_end)
+            raw = self.text_area.get(line_start, line_end)
+            line = raw.lstrip("\u2713 \u2717 ")
             self._parse_and_show(line)
         except tk.TclError:
             pass
@@ -165,12 +187,13 @@ class TextComparer:
     def _delete_line(self, line, popup):
         """Удалить прокси из списка, обновить окно и счётчик статуса."""
         self.result_lines = [l for l in self.result_lines if l != line]
+        self.alive.pop(line, None)
         self.deleted_count += 1
-        text = "\n".join(self.result_lines)
-        self._set_text(text)
+        self._refresh_display()
         self.status_var.set(f"Строк: {len(self.result_lines)}, удалено: {self.deleted_count}")
         if not self.result_lines:
             self.btn_save.config(state=tk.DISABLED)
+            self.btn_check.config(state=tk.DISABLED)
         popup.destroy()
 
     def _copy_value(self, text):
@@ -182,6 +205,109 @@ class TextComparer:
         """Прочитать строки из файла, удалить символы перевода строки."""
         with open(path, "r", encoding="utf-8-sig") as f:
             return [line.rstrip("\n\r") for line in f]
+
+    def _load_config(self):
+        """Загрузить config.json, вернуть (api_id, api_hash) или None."""
+        try:
+            with open("config.json", "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            return (cfg["api_id"], cfg["api_hash"])
+        except Exception:
+            return None
+
+    def _save_config(self, api_id, api_hash):
+        """Сохранить api_id/api_hash в config.json."""
+        with open("config.json", "w", encoding="utf-8") as f:
+            json.dump({"api_id": api_id, "api_hash": api_hash}, f)
+
+    def _show_config_dialog(self):
+        """Показать диалог ввода api_id и api_hash."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Настройки API Telegram")
+        dialog.geometry("400x180")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tk.Label(dialog, text="api_id:").grid(row=0, column=0, padx=10, pady=10, sticky="e")
+        entry_id = tk.Entry(dialog, width=35)
+        entry_id.grid(row=0, column=1, padx=10, pady=10)
+
+        tk.Label(dialog, text="api_hash:").grid(row=1, column=0, padx=10, pady=10, sticky="e")
+        entry_hash = tk.Entry(dialog, width=35)
+        entry_hash.grid(row=1, column=1, padx=10, pady=10)
+
+        result = {"ok": False}
+
+        def _save():
+            try:
+                api_id = int(entry_id.get().strip())
+                api_hash = entry_hash.get().strip()
+                if not api_hash:
+                    raise ValueError
+                self._save_config(api_id, api_hash)
+                result["ok"] = True
+                dialog.destroy()
+            except ValueError:
+                messagebox.showerror("Ошибка", "api_id должен быть числом, api_hash — непустой строкой.")
+
+        tk.Button(dialog, text="Сохранить", command=_save).grid(row=2, column=0, columnspan=2, pady=15)
+        self.root.wait_window(dialog)
+        return result["ok"]
+
+    def _on_check(self):
+        """Запустить проверку прокси через Telethon."""
+        if self._checking or not self.result_lines:
+            return
+
+        config = self._load_config()
+        if config is None:
+            ok = self._show_config_dialog()
+            if not ok:
+                return
+            config = self._load_config()
+            if config is None:
+                return
+
+        api_id, api_hash = config
+        self._checking = True
+        self.btn_check.config(state=tk.DISABLED, text="Проверка...")
+        self.btn_open.config(state=tk.DISABLED)
+        self.status_var.set("Проверка прокси...")
+
+        def _run():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                results = loop.run_until_complete(
+                    check_all(self.result_lines, api_id, api_hash)
+                )
+                self.root.after(0, self._finish_check, results)
+            except Exception as e:
+                self.root.after(0, lambda: self._fail_check(str(e)))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _finish_check(self, results):
+        """Обработать результаты проверки."""
+        for line, ok in results:
+            self.alive[line] = ok
+
+        alive_count = sum(1 for v in self.alive.values() if v)
+        dead_count = sum(1 for v in self.alive.values() if not v)
+
+        self._refresh_display()
+        self.status_var.set(f"Живых: {alive_count}, мёртвых: {dead_count}")
+        self._checking = False
+        self.btn_check.config(state=tk.NORMAL, text="Проверить")
+        self.btn_open.config(state=tk.NORMAL)
+
+    def _fail_check(self, error):
+        """Обработать ошибку проверки."""
+        self.status_var.set(f"Ошибка проверки: {error}")
+        self._checking = False
+        self.btn_check.config(state=tk.NORMAL, text="Проверить")
+        self.btn_open.config(state=tk.NORMAL)
 
     def _on_open(self):
         """Выбрать старый (эталон) и новый списки прокси, найти новые записи."""
@@ -204,31 +330,39 @@ class TextComparer:
             lines2 = set(self._read_file_lines(file2))
             self.result_lines = list(lines2 - lines1)
             self.deleted_count = 0
+            self.alive = {}
 
             if self.result_lines:
-                self._set_text("\n".join(self.result_lines))
+                self._refresh_display()
                 self.status_var.set(
                     f"Найдено строк: {len(self.result_lines)} — "
                     f"{os.path.basename(file1)} / {os.path.basename(file2)}"
                 )
                 self.btn_save.config(state=tk.NORMAL)
+                self.btn_check.config(state=tk.NORMAL)
             else:
-                self._set_text(
-                    "Все строки из File_2 присутствуют в File_1.\n"
-                    "Новых строк не найдено."
-                )
+                self._refresh_display()
                 self.status_var.set("Новых строк не найдено")
                 self.btn_save.config(state=tk.DISABLED)
+                self.btn_check.config(state=tk.DISABLED)
 
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось прочитать файлы:\n{e}")
             self.status_var.set("Ошибка чтения")
 
     def _on_save(self):
-        """Сохранить отобранный список прокси в файл (File_3)."""
+        """Сохранить только живые прокси в файл (File_3)."""
         if not self.result_lines:
             messagebox.showinfo("Информация", "Нет данных для сохранения.")
             return
+
+        if self.alive:
+            to_save = [l for l in self.result_lines if self.alive.get(l, False)]
+            if not to_save:
+                messagebox.showinfo("Информация", "Нет живых прокси для сохранения.")
+                return
+        else:
+            to_save = self.result_lines
 
         file3 = filedialog.asksaveasfilename(
             title="Сохранить результат как File_3",
@@ -240,11 +374,11 @@ class TextComparer:
 
         try:
             with open(file3, "w", encoding="utf-8") as f:
-                for line in self.result_lines:
+                for line in to_save:
                     f.write(line + "\n")
             self.status_var.set(
                 f"Сохранено: {os.path.basename(file3)} "
-                f"({len(self.result_lines)} строк)"
+                f"({len(to_save)} прокси)"
             )
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось сохранить файл:\n{e}")
